@@ -1,0 +1,156 @@
+# Upstream ceph carries no image-building CI in this repo: container/build.sh is
+# driven from ceph's own release tooling, and the workflows on main are all PR
+# hygiene. This one builds the overlay described in container/Containerfile.fivetime
+# -- ceph v20.2.4 plus ceph/ceph#69250, the Python half of the #71041 backport,
+# and an nfs-ganesha new enough to answer GET_DIR_DELEGATION with NOTSUPP.
+#
+# The image is verified before it is pushed, not after: an image that only looks
+# patched is the failure worth spending a step on.
+name: fivetime ceph image
+
+on:
+  push:
+    branches: ["v20.2.4-fivetime"]
+    paths:
+      - "container/Containerfile.fivetime"
+      - "container/Containerfile.fivetime.dockerignore"
+      - "src/pybind/mgr/nfs/cluster.py"
+      - "src/pybind/mgr/rook/rook_cluster.py"
+      - "src/pybind/mgr/prometheus/module.py"
+      - ".github/workflows/build-fivetime-image.yml"
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: "Image to overlay"
+        default: "quay.io/ceph/ceph:v20.2.4"
+      ganesha_sig_stream:
+        description: "CentOS Storage SIG nfs-ganesha stream (9 is the smallest jump carrying the fix, 15 is newest)"
+        default: "9"
+      ganesha_min_version:
+        description: "Build fails if the installed nfs-ganesha is older than this"
+        default: "9.11"
+      push:
+        description: "Push to ghcr.io"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: fivetime-ceph-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Work out image and tags
+        id: meta
+        run: |
+          set -eu
+          base="${{ inputs.base_image }}"; [ -n "$base" ] || base="quay.io/ceph/ceph:v20.2.4"
+          stream="${{ inputs.ganesha_sig_stream }}"; [ -n "$stream" ] || stream=9
+          floor="${{ inputs.ganesha_min_version }}"; [ -n "$floor" ] || floor=9.11
+          ver="${base##*:}"                      # quay.io/ceph/ceph:v20.2.4 -> v20.2.4
+          sha="$(git rev-parse --short=12 HEAD)"
+          image="ghcr.io/${{ github.repository_owner }}/ceph"
+          push=true
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.push }}" = "false" ]; then
+            push=false
+          fi
+          {
+            echo "base=$base"; echo "stream=$stream"; echo "floor=$floor"
+            echo "version=${ver#v}"; echo "image=$image"
+            # Moving tag for humans; pinned tag for CephCluster.spec.cephVersion.image,
+            # where a tag that moves under you is an unplanned cluster-wide restart.
+            echo "moving=${image}:${ver}-fivetime"
+            echo "pinned=${image}:${ver}-fivetime-${sha}"
+            echo "push=$push"
+          } >> "$GITHUB_OUTPUT"
+
+      # workflow_dispatch needs this file on the default branch to be dispatchable
+      # at all, which means it can also be dispatched *with* the default branch as
+      # the ref. That would copy main's mgr Python (21.0.0 at the time of writing)
+      # over a 20.2.4 image and produce something that starts and misbehaves. The
+      # source tree has to be the same release as the image it patches.
+      - name: Refuse a source tree that is not the base image's release
+        run: |
+          set -eu
+          tree="$(grep -m1 -oP '^\s*VERSION\s+\K[0-9]+\.[0-9]+\.[0-9]+' CMakeLists.txt)"
+          want="${{ steps.meta.outputs.version }}"
+          echo "source tree ${tree}, base image ${want}"
+          if [ "$tree" != "$want" ]; then
+            echo "::error::checked-out ref ${{ github.ref }} is ceph ${tree}, but the base image is ${want}." \
+                 "Dispatch this workflow with ref=v20.2.4-fivetime, or pass a matching base_image."
+            exit 1
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        if: steps.meta.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # --load, not --push: the image has to exist locally to be checked first.
+      - name: Build
+        run: |
+          set -eux
+          docker buildx build \
+            --file container/Containerfile.fivetime \
+            --build-arg "BASE_IMAGE=${{ steps.meta.outputs.base }}" \
+            --build-arg "GANESHA_SIG_STREAM=${{ steps.meta.outputs.stream }}" \
+            --build-arg "GANESHA_MIN_VERSION=${{ steps.meta.outputs.floor }}" \
+            --tag "${{ steps.meta.outputs.moving }}" \
+            --tag "${{ steps.meta.outputs.pinned }}" \
+            --load \
+            .
+
+      # The Containerfile asserts the same things while building. Repeating them
+      # against the finished image is what catches a layer served from cache after
+      # its input changed.
+      - name: Verify the built image
+        run: |
+          set -eux
+          docker run --rm --entrypoint bash "${{ steps.meta.outputs.pinned }}" -c '
+            set -eu
+            test "$(grep -c "join(\[addr.address" /usr/share/ceph/mgr/rook/rook_cluster.py)" = 0
+            grep -q InternalIP /usr/share/ceph/mgr/rook/rook_cluster.py
+            grep -q "node-proxy is only implemented by the cephadm" /usr/share/ceph/mgr/prometheus/module.py
+            rpm -q nfs-ganesha nfs-ganesha-ceph
+            ganesha.nfsd -v
+            ceph --version
+          '
+
+      - name: Push
+        if: steps.meta.outputs.push == 'true'
+        run: |
+          set -eux
+          docker push "${{ steps.meta.outputs.pinned }}"
+          docker push "${{ steps.meta.outputs.moving }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### fivetime ceph image"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| base | \`${{ steps.meta.outputs.base }}\` |"
+            echo "| pinned | \`${{ steps.meta.outputs.pinned }}\` |"
+            echo "| moving | \`${{ steps.meta.outputs.moving }}\` |"
+            echo "| ganesha SIG stream | ${{ steps.meta.outputs.stream }} (floor ${{ steps.meta.outputs.floor }}) |"
+            echo "| pushed | ${{ steps.meta.outputs.push }} |"
+            echo
+            echo "Use the **pinned** tag in \`CephCluster.spec.cephVersion.image\`."
+          } >> "$GITHUB_STEP_SUMMARY"

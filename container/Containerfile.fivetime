@@ -1,0 +1,90 @@
+# Ceph v20.2.4 plus the three upstream fixes this cluster needs, none of which
+# are in any released tag. This is an overlay on the official image, not a
+# source build, because that is the shape the three fixes actually have: two are
+# mgr Python files that the image ships verbatim, and the third is a package.
+#
+#   1. ceph/ceph#69250 -- open upstream at the time of this build.
+#      mgr/rook joins every address of a k8s Node with "/" into HostSpec.addr,
+#      so `ceph nfs cluster info` cannot resolve it:
+#        Error EINVAL: Cannot resolve IP for host
+#          10.32.16.69/fc00:1:2:3:10:32:16:69/osp-control4
+#      Manila's _get_export_ips() calls exactly that, so this one defect is what
+#      blocks the Manila NFS integration. Everything else about the NFS service
+#      works: cluster ls, export create, export ls, export info.
+#
+#   2. ceph/ceph#70967, tentacle backport #71041 -- merged into the tentacle
+#      branch on 2026-08-25, seven days after v20.2.4 was tagged, so it is in no
+#      release. mgr/prometheus called node_proxy_fullreport() on every scrape;
+#      the rook orchestrator does not implement it, and mgr recorded a crash
+#      dump for each one. This cluster collected 109 of them and went HEALTH_ERR
+#      when archiving them raced with new ones arriving.
+#      Only the Python half is here. The backport's other two commits,
+#      03272001c80 and 3ddab990f00, change src/mgr/ActivePyModules.cc and would
+#      need a full ceph build. Those stop mgr recording a crash *if* the call
+#      happens; this Python guard stops the call happening at all, which is the
+#      half that removes the symptom. If the C++ half is ever wanted, this
+#      overlay is the wrong tool -- build ceph from container/Containerfile.
+#
+#   3. nfs-ganesha answers OP_GET_DIR_DELEGATION (opcode 46) with OP_ILLEGAL,
+#      and a kernel-7.0 NFS client turns that into EREMOTEIO on readdir (~13% of
+#      `ls` calls, entries all correct, exit code non-zero). Nothing to patch in
+#      ceph: upstream ganesha changed that dispatch entry to nfs4_op_notsupp in
+#      V9.11, and the image carries V5.9 only because that is what the CentOS
+#      Storage SIG had built for el9s when the image was made. So install a
+#      newer build of the same SIG package.
+#
+# Build context is deliberately three files -- see Containerfile.fivetime.dockerignore.
+
+ARG BASE_IMAGE=quay.io/ceph/ceph:v20.2.4
+FROM ${BASE_IMAGE}
+
+# Which nfs-ganesha stream to take from the CentOS Storage SIG. 9 is the
+# smallest jump from the shipped 5.9 that carries the GET_DIR_DELEGATION change
+# (V9.11), which is why it is the default; 15 is the newest series. Both are
+# built for el9s and resolve against the libcephfs already in this image --
+# neither pulls or replaces a single ceph package.
+ARG GANESHA_SIG_STREAM=9
+# Asserted below. 9.11 is the first release with nfs4_op_notsupp for
+# GET_DIR_DELEGATION; 9.10 and earlier still answer nfs4_op_illegal.
+ARG GANESHA_MIN_VERSION=9.11
+
+# 1 and 2. The image ships these as plain source; there is no __pycache__ under
+# /usr/share/ceph/mgr, so replacing the file is the whole change.
+COPY src/pybind/mgr/nfs/cluster.py        /usr/share/ceph/mgr/nfs/cluster.py
+COPY src/pybind/mgr/rook/rook_cluster.py  /usr/share/ceph/mgr/rook/rook_cluster.py
+COPY src/pybind/mgr/prometheus/module.py  /usr/share/ceph/mgr/prometheus/module.py
+
+# 3. centos-release-nfs-ganesha<N> brings both the repo definition and the SIG
+# signing key, so this stays a signed path -- the image has no Storage SIG key
+# of its own, only the Extras SIG one.
+RUN set -eux; \
+    dnf -y install "centos-release-nfs-ganesha${GANESHA_SIG_STREAM}"; \
+    dnf -y upgrade \
+        nfs-ganesha \
+        nfs-ganesha-ceph \
+        nfs-ganesha-rados-grace \
+        nfs-ganesha-rados-urls \
+        nfs-ganesha-rgw; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf
+
+# Fail the build rather than ship an image that looks patched and is not. Each
+# check is the same one used to diagnose the defect in the first place.
+RUN set -eux; \
+    ! grep -q 'join(\[addr.address' /usr/share/ceph/mgr/rook/rook_cluster.py; \
+    grep -q 'InternalIP' /usr/share/ceph/mgr/rook/rook_cluster.py; \
+    grep -q 'node-proxy is only implemented by the cephadm' /usr/share/ceph/mgr/prometheus/module.py; \
+    python3 -m py_compile \
+        /usr/share/ceph/mgr/nfs/cluster.py \
+        /usr/share/ceph/mgr/rook/rook_cluster.py \
+        /usr/share/ceph/mgr/prometheus/module.py; \
+    find /usr/share/ceph/mgr -name __pycache__ -prune -exec rm -rf {} +; \
+    v="$(rpm -q --qf '%{VERSION}' nfs-ganesha)"; \
+    echo "nfs-ganesha ${v}, floor ${GANESHA_MIN_VERSION}"; \
+    [ "$(printf '%s\n%s\n' "${GANESHA_MIN_VERSION}" "${v}" | sort -V | head -1)" = "${GANESHA_MIN_VERSION}" ]; \
+    ceph --version
+
+LABEL org.opencontainers.image.title="ceph (fivetime)" \
+      org.opencontainers.image.description="Ceph v20.2.4 with ceph/ceph#69250, the Python half of #71041, and nfs-ganesha >= 9.11" \
+      org.opencontainers.image.source="https://github.com/fivetime/ceph" \
+      io.fivetime.ceph.fixes="ceph/ceph#69250; ceph/ceph#70967 (python half, via #71041); nfs-ganesha GET_DIR_DELEGATION -> nfs4_op_notsupp"

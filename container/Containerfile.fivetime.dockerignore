@@ -1,0 +1,6 @@
+# The overlay needs exactly three files. Without this the build context is the
+# whole ceph tree plus .git, roughly a gigabyte, for 60 kB of payload.
+**
+!src/pybind/mgr/nfs/cluster.py
+!src/pybind/mgr/rook/rook_cluster.py
+!src/pybind/mgr/prometheus/module.py
