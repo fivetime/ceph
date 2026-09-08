@@ -93,3 +93,39 @@ kubectl -n rook-ceph exec <nfs pod> -c nfs-ganesha -- ganesha.nfsd -v   # 3: >= 
 
 For 3, the discriminating check is not the version string but the client
 behaviour: a kernel-7.0 client's `ls` in a loop should stop returning non-zero.
+
+## Retiring this
+
+This overlay is meant to be thrown away, and it is built to say so. Its first
+build step inspects the base image and **fails** if the base already carries any
+of the three fixes, naming which one — copying our v20.2.4-era mgr Python onto a
+newer base would otherwise overwrite a fixed file with a stale one and print
+nothing:
+
+```
+ERROR: base image quay.io/ceph/ceph:v20.2.5 already carries: ceph/ceph#69250(mgr/rook)
+This overlay has outlived that part. Retire it instead of rebuilding.
+```
+
+When that fires, do not delete the check. Either drop the COPY for the part
+upstream has taken over, or — once **all three** pass — stop building this
+entirely and point `CephCluster.spec.cephVersion.image` back at the official tag.
+
+The exit condition is one command against a candidate official image, and needs
+no knowledge of which PRs merged:
+
+```bash
+docker run --rm --entrypoint bash quay.io/ceph/ceph:vX.Y.Z -c '
+  grep -c "join(\[addr.address" /usr/share/ceph/mgr/rook/rook_cluster.py             # want 0
+  grep -c "node-proxy is only implemented" /usr/share/ceph/mgr/prometheus/module.py  # want 1
+  ganesha.nfsd -v'                                                                   # want >= V9.11
+```
+
+Nothing here needs periodic attention in the meantime. The branch is three
+commits on a frozen tag: it does not track upstream, does not need rebasing, and
+the image does not need rebuilding. The only work is the day it is retired.
+
+What holds the third check back is not a Ceph code fix at all: `tentacle` pins
+the Ganesha repo to `nfsganesha-5` in `container/Containerfile`, while `main`
+moved to `nfsganesha-9` in #67906. Backport submitted as
+[ceph/ceph#71599](https://github.com/ceph/ceph/pull/71599).

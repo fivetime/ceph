@@ -37,6 +37,9 @@
 
 ARG BASE_IMAGE=quay.io/ceph/ceph:v20.2.4
 FROM ${BASE_IMAGE}
+# Re-declared: an ARG from before the first FROM is out of scope inside the
+# stage, and the retirement check below names the base image in its error.
+ARG BASE_IMAGE
 
 # Which nfs-ganesha stream to take from the CentOS Storage SIG. 9 is the
 # smallest jump from the shipped 5.9 that carries the GET_DIR_DELEGATION change
@@ -47,6 +50,31 @@ ARG GANESHA_SIG_STREAM=9
 # Asserted below. 9.11 is the first release with nfs4_op_notsupp for
 # GET_DIR_DELEGATION; 9.10 and earlier still answer nfs4_op_illegal.
 ARG GANESHA_MIN_VERSION=9.11
+
+# This overlay is meant to be thrown away, and the moment to throw it away is a
+# build against a base that already carries one of the three fixes. The mgr
+# Python here is cut from v20.2.4; copying it onto a newer base would overwrite
+# a fixed file with a stale one and say nothing. So check the base first and
+# refuse, naming the part that has become redundant.
+#
+# When this fires, do not "fix" it by deleting the check. Retire whichever part
+# upstream has taken over: drop the corresponding COPY (or the whole overlay,
+# and switch CephCluster.spec.cephVersion.image back to the official tag).
+RUN set -eu; \
+    stale=""; \
+    grep -q 'join(\[addr.address' /usr/share/ceph/mgr/rook/rook_cluster.py \
+      || stale="${stale} ceph/ceph#69250(mgr/rook)"; \
+    grep -q 'node-proxy is only implemented by the cephadm' /usr/share/ceph/mgr/prometheus/module.py \
+      && stale="${stale} ceph/ceph#70967(mgr/prometheus)" || true; \
+    v="$(rpm -q --qf '%{VERSION}' nfs-ganesha 2>/dev/null || echo 0)"; \
+    [ "$(printf '%s\n%s\n' "${GANESHA_MIN_VERSION}" "$v" | sort -V | head -1)" = "${GANESHA_MIN_VERSION}" ] \
+      && stale="${stale} nfs-ganesha(base已是 ${v})" || true; \
+    if [ -n "$stale" ]; then \
+        echo "ERROR: base image ${BASE_IMAGE} already carries:${stale}"; \
+        echo "This overlay has outlived that part. Retire it instead of rebuilding."; \
+        exit 1; \
+    fi; \
+    echo "base still needs all three fixes; proceeding"
 
 # 1 and 2. The image ships these as plain source; there is no __pycache__ under
 # /usr/share/ceph/mgr, so replacing the file is the whole change.
